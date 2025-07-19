@@ -7,9 +7,9 @@ import argparse
 import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
-from model import GCN, modularity, avg_max_int_weight, avg_max_int_degree
+from model import GCN, map_eq_loss
 from utils import *
-from dataset import load_feat, load_labels, FeatureDataset
+from dataset import load_feat, load_labels
 from metrics import pairwise, bcubed
 from torch_scatter import scatter
 from torch.utils.tensorboard import SummaryWriter
@@ -57,14 +57,7 @@ def train(model, optimizer, training_loader, labels, iterations, config, device)
         data, nbrs = gen_graph(b_features, config, K, device)
         out = model(data.x, data.edge_index)  # Perform a single forward pass.
 
-        init_mod = modularity(data.x, nbrs, b_labels, data['nbrs_bounds'])
-        mod = modularity(out, nbrs, b_labels, data['nbrs_bounds'])
-
-        # modularity diff
-        mod_diff = torch.clamp(mod - init_mod, max=0.5 * init_mod).sum()
-
-        curr_loss = - mod_diff \
-                    + avg_max_int_weight(out, nbrs, b_labels)
+        curr_loss = map_eq_loss(out, nbrs, b_labels)
 
         curr_loss.backward()  # Derive gradients.
         optimizer.step()  # Update parameters based on gradients.
@@ -262,7 +255,7 @@ def main(config_path, device):
         tb_writer.add_scalar('Train/Loss', epoch_loss, epoch)
 
         # Evaluate
-        if epoch > 10 and epoch % 4 == 0:
+        if epoch > -1 and epoch % 1 == 0:
             print(f'Epoch: {epoch:05d}, Loss: {epoch_loss:.4f}')
 
             model.eval()
