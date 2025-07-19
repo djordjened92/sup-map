@@ -255,7 +255,7 @@ def main(config_path, device):
         tb_writer.add_scalar('Train/Loss', epoch_loss, epoch)
 
         # Evaluate
-        if epoch > -1 and epoch % 1 == 0:
+        if epoch > 0 and epoch % 8 == 0:
             print(f'Epoch: {epoch:05d}, Loss: {epoch_loss:.4f}')
 
             model.eval()
