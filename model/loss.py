@@ -1,7 +1,7 @@
 import torch
 from torch_scatter import scatter
 
-def smart_teleportation(weights, num_of_nodes, nbrs, tau, iterations=1000, prob_delta=1e-3):
+def smart_teleportation(weights, num_of_nodes, nbrs, tau, iterations=1000, prob_delta=1e-5):
     # The initial visit frequency estimation is 1/n
     p = torch.ones(num_of_nodes, device=nbrs.device) * (1 / num_of_nodes)
 
@@ -12,7 +12,7 @@ def smart_teleportation(weights, num_of_nodes, nbrs, tau, iterations=1000, prob_
         w_in[:w_in_scat.shape[0]] = w_in_scat # if some of nodes doesn't appear as neighbour
 
         # Teleportation of probability
-        p_new = w_in + (tau / num_of_nodes) * p
+        p_new = w_in + tau / num_of_nodes
 
         # Check successive probability delta
         delta = (p_new - p).abs().sum().item()
@@ -20,7 +20,7 @@ def smart_teleportation(weights, num_of_nodes, nbrs, tau, iterations=1000, prob_
             break
 
         p = p_new
-        p /= p.sum() # secure the probability mass distribution attribute that sum is 1
+        # print(p.sum())
 
     # print(f'Teleportation iterations: {i}')
 

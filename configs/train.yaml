@@ -1,5 +1,5 @@
 # Model dir
-MODEL_NAME: bs60_k60_lr1.1e-4_ep500_do0.15_018
+MODEL_NAME: bs60_k60_lr1.1e-4_ep500_do0.15_001
 CHECKPOINT_DIR: './checkpoints'
 
 # Data
