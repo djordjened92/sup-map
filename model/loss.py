@@ -1,7 +1,7 @@
 import torch
 from torch_scatter import scatter
 
-def smart_teleportation(weights, num_of_nodes, nbrs, tau, iterations=1000, prob_delta=1e-5):
+def smart_teleportation(weights, num_of_nodes, nbrs, tau, iterations=1000, prob_delta=5e-6):
     # The initial visit frequency estimation is 1/n
     p = torch.ones(num_of_nodes, device=nbrs.device) * (1 / num_of_nodes)
 
@@ -46,7 +46,7 @@ def module_exit_prob(weights, num_of_nodes, nbrs, labels, tau=0.15):
 
     me_prob = teleport_part + out_of_module
 
-    return me_prob, module_visit_rate
+    return me_prob, module_visit_rate, p
 
 def map_eq_loss(inf_result, nbrs, labels):
     '''
@@ -68,10 +68,11 @@ def map_eq_loss(inf_result, nbrs, labels):
 
     # mep - vector of exit probabilities per module, the length is number of modules
     # mvr - vector of visit probabilities per module, the length is number of modules
-    mep, mvr = module_exit_prob(out_sims, num_of_nodes, nbrs, labels)
+    mep, mvr, p = module_exit_prob(out_sims, num_of_nodes, nbrs, labels)
 
     # Loss calculation
     codelength = mep.sum() * torch.log2(mep.sum() + torch.finfo().eps) \
                  - 2 * (mep * torch.log2(mep + torch.finfo().eps)).sum() \
+                 - (p * torch.log2(p + torch.finfo().eps)).sum() \
                  + ((mep + mvr) * torch.log2(mep + mvr + torch.finfo().eps)).sum()
     return codelength
