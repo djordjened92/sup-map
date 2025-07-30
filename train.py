@@ -57,6 +57,9 @@ def train(model, optimizer, training_loader, labels, iterations, config, device)
         data, nbrs = gen_graph(b_features, config, K, device)
         out = model(data.x, data.edge_index)  # Perform a single forward pass.
 
+        # init_codelength = map_eq_loss(data.x, nbrs, b_labels)
+        # codelength = map_eq_loss(out, nbrs, b_labels)
+        # curr_loss = torch.clamp(codelength - init_codelength, min=init_codelength)
         curr_loss = map_eq_loss(out, nbrs, b_labels)
 
         curr_loss.backward()  # Derive gradients.
@@ -171,7 +174,7 @@ def main(config_path, device):
     batch_size = config['BATCH_SIZE']
     train_loader = NeighborLoader(
         train_in_graph,
-        num_neighbors=[40],
+        num_neighbors=[-1, -1],
         batch_size=batch_size,
         shuffle=True
     )
