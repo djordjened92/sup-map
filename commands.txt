@@ -1,0 +1,34 @@
+---------------------------------------------------------------
+1. Preparing Docker Image:
+docker run --rm --gpus device=0 -ti -v /home/djordje/Documents:/home/djordje/Documents --name pyg nvcr.io/nvidia/pyg:24.05-py3 bash
+
+2. PyTorch:
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+3. torch-scatter, sparse...:
+pip uninstall -y torch-scatter torch-sparse torch-cluster torch-spline-conv pyg-lib torch-geometric
+pip install torch-scatter torch-sparse torch-cluster torch-spline-conv pyg-lib \
+    -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
+
+pip install torch-geometric
+
+pip install --upgrade "optree>=0.13.0"
+python -c "import torch; import torch_geometric; import torch_sparse; print(torch.__version__); print(torch_sparse.__version__)"
+
+4. FAISS:
+(check if faiss-gpu: faiss.get_num_gpus())
+
+pip uninstall -y faiss-gpu
+pip install faiss-gpu-cu12
+
+5. other libraries:
+pip install infomap
+pip install pytorch-metric-learning
+
+---------------------------------------------------------------
+
+docker run --rm -ti \
+--gpus device=0 \
+-v /home/djordje/Documents/Projects:/home/djordje/Documents/Projects \
+--name pyg \
+pyg:latest bash
