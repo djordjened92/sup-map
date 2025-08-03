@@ -1,7 +1,7 @@
 import dgl
 import torch
 import numpy as np
-from utils import l2norm, knn_faiss, knns2spmat, sparse_mx_to_indices_values, to_dgl
+from utils import l2norm, knn_faiss, knns2spmat, sparse_mx_to_indices_values
 from dataset import load_feat, load_labels, FeatureDataset
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
