@@ -20,3 +20,5 @@ checkpoints/
 
 *.pt
 *.txt
+
+!commands.txt
