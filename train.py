@@ -9,7 +9,7 @@ import torch.nn as nn
 from tqdm import tqdm
 from model import GCN, map_eq_loss
 from utils import *
-from dataset import load_feat, load_labels
+from dataset import load_feat, load_labels, FeatureDataset
 from metrics import pairwise, bcubed
 from torch_scatter import scatter
 from torch.utils.tensorboard import SummaryWriter
@@ -47,8 +47,7 @@ def train(model, optimizer, training_loader, labels, iterations, config, device)
     running_loss = 0.
 
     for i in tqdm(range(iterations), 'Train loader:'):
-        data = next(training_loader)
-        b_features, b_labels = data.x, labels[data.n_id]
+        b_features, b_labels = next(training_loader)
         b_features = b_features.to(device)
         b_labels = b_labels.to(device)
         
@@ -108,17 +107,17 @@ def main(config_path, device):
     graph_dir = f'ws{config["WINDOW_SIZE"]}'
 
     if os.path.exists(graph_dir):
-        test_in_graph = torch.load(f'{graph_dir}/test_graph.pt')
-        test_nbrs_bounds = torch.load(f'{graph_dir}/test_nbrs_bounds.pt')
+        test_in_graph = torch.load(f'{graph_dir}/test_graph.pt', weights_only=False)
+        test_nbrs_bounds = torch.load(f'{graph_dir}/test_nbrs_bounds.pt', weights_only=False)
         test_in_graph['nbrs_bounds'] = test_nbrs_bounds
-        test_nbrs = torch.load(f'{graph_dir}/test_nbrs.pt')
-        test_ji = torch.load(f'{graph_dir}/test_ji.pt')
+        test_nbrs = torch.load(f'{graph_dir}/test_nbrs.pt', weights_only=False)
+        test_ji = torch.load(f'{graph_dir}/test_ji.pt', weights_only=False)
 
-        train_in_graph = torch.load(f'{graph_dir}/train_graph.pt')
-        train_nbrs_bounds = torch.load(f'{graph_dir}/train_nbrs_bounds.pt')
+        train_in_graph = torch.load(f'{graph_dir}/train_graph.pt', weights_only=False)
+        train_nbrs_bounds = torch.load(f'{graph_dir}/train_nbrs_bounds.pt', weights_only=False)
         train_in_graph['nbrs_bounds'] = train_nbrs_bounds
-        train_nbrs = torch.load(f'{graph_dir}/train_nbrs.pt')
-        train_ji = torch.load(f'{graph_dir}/train_ji.pt')
+        train_nbrs = torch.load(f'{graph_dir}/train_nbrs.pt', weights_only=False)
+        train_ji = torch.load(f'{graph_dir}/train_ji.pt', weights_only=False)
     else:
         os.makedirs(graph_dir)
 
@@ -172,12 +171,12 @@ def main(config_path, device):
     print(f"Mean of neighbour bound: {test_in_graph['nbrs_bounds'].float().mean()}")
 
     batch_size = config['BATCH_SIZE']
-    train_loader = NeighborLoader(
-        train_in_graph,
-        num_neighbors=[-1, -1],
-        batch_size=batch_size,
-        shuffle=True
-    )
+    # train_loader = NeighborLoader(
+    #     train_in_graph,
+    #     num_neighbors=[-1, -1],
+    #     batch_size=batch_size,
+    #     shuffle=True
+    # )
     test_loader = NeighborLoader(
         test_in_graph,
         num_neighbors=[-1, -1],
@@ -192,12 +191,12 @@ def main(config_path, device):
     print(f'#cls: {val_classes}')
 
     # Create Dataset
-    # train_dataset = FeatureDataset(train_features, train_labels)
-    # sampler = samplers.MPerClassSampler(labels=train_labels,
-    #                                     m=config['SAMPLES_PER_CLASS'],
-    #                                     batch_size=batch_size,
-    #                                     length_before_new_iter=250000)
-    # dataloader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+    train_dataset = FeatureDataset(train_features, train_labels)
+    sampler = samplers.MPerClassSampler(labels=train_labels,
+                                        m=config['SAMPLES_PER_CLASS'],
+                                        batch_size=batch_size,
+                                        length_before_new_iter=250000)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
 
     # Create model
     model = GCN(in_dim=feat_dim, hidden_dim=config['HIDDEN_DIM'], out_dim=config['OUT_DIM'], dropout=config['DROPOUT'])

@@ -26,7 +26,7 @@ def smart_teleportation(weights, num_of_nodes, nbrs, tau, iterations=1000, prob_
 
     return p
 
-def module_exit_prob(weights, num_of_nodes, nbrs, labels, tau=0.15):
+def module_exit_prob(weights, num_of_nodes, nbrs, labels, tau=0.1):
     '''
     The implementation of exit probability for modules
     according to the section B. Directed weighted networks
@@ -73,6 +73,5 @@ def map_eq_loss(inf_result, nbrs, labels):
     # Loss calculation
     codelength = mep.sum() * torch.log2(mep.sum() + torch.finfo().eps) \
                  - 2 * (mep * torch.log2(mep + torch.finfo().eps)).sum() \
-                 - (p * torch.log2(p + torch.finfo().eps)).sum() \
                  + ((mep + mvr) * torch.log2(mep + mvr + torch.finfo().eps)).sum()
     return codelength
