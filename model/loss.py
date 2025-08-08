@@ -1,7 +1,7 @@
 import torch
 from torch_scatter import scatter
 
-def smart_teleportation(weights, num_of_nodes, nbrs, tau, iterations=1000, prob_delta=5e-6):
+def smart_teleportation(weights, num_of_nodes, nbrs, tau, iterations=1, prob_delta=5e-6):
     # The initial visit frequency estimation is 1/n
     p = torch.ones(num_of_nodes, device=nbrs.device) * (1 / num_of_nodes)
 
@@ -15,9 +15,9 @@ def smart_teleportation(weights, num_of_nodes, nbrs, tau, iterations=1000, prob_
         p_new = w_in + tau / num_of_nodes
 
         # Check successive probability delta
-        delta = (p_new - p).abs().sum().item()
-        if delta < prob_delta:
-            break
+        # delta = (p_new - p).abs().sum().item()
+        # if delta < prob_delta:
+        #     break
 
         p = p_new
         # print(p.sum())
@@ -26,7 +26,7 @@ def smart_teleportation(weights, num_of_nodes, nbrs, tau, iterations=1000, prob_
 
     return p
 
-def module_exit_prob(weights, num_of_nodes, nbrs, labels, tau=0.1):
+def module_exit_prob(weights, num_of_nodes, nbrs, L, l_indices, module_size, tau):
     '''
     The implementation of exit probability for modules
     according to the section B. Directed weighted networks
@@ -34,11 +34,8 @@ def module_exit_prob(weights, num_of_nodes, nbrs, labels, tau=0.1):
     '''
     p = smart_teleportation(weights, num_of_nodes, nbrs, tau)
 
-    _, l_indices, module_size = torch.unique(labels, return_inverse=True, return_counts=True) # count nodes per label and map it to [0, len-1]
     module_visit_rate = scatter(p, l_indices, reduce='sum')
     teleport_part = module_visit_rate * tau * (num_of_nodes - module_size) / num_of_nodes
-
-    L = l_indices[nbrs]
     out_module_mask = (L != l_indices[:, None]).int()
     out_of_module = p[:, None] * weights * out_module_mask
     out_of_module = out_of_module.sum(dim=1) * (1 - tau)
@@ -66,9 +63,15 @@ def map_eq_loss(inf_result, nbrs, labels):
     out_sims = out_sims.squeeze()
     out_sims /= out_sims.sum(dim=1, keepdim=True) + torch.finfo().eps
 
+    # Manage labels
+    _, l_indices, module_size = torch.unique(labels, return_inverse=True, return_counts=True) # count nodes per label and map it to [0, len-1]
+    L = l_indices[nbrs]
+
+    tau=0
+
     # mep - vector of exit probabilities per module, the length is number of modules
     # mvr - vector of visit probabilities per module, the length is number of modules
-    mep, mvr, p = module_exit_prob(out_sims, num_of_nodes, nbrs, labels)
+    mep, mvr, p = module_exit_prob(out_sims, num_of_nodes, nbrs, L, l_indices, module_size, tau)
 
     # Loss calculation
     codelength = mep.sum() * torch.log2(mep.sum() + torch.finfo().eps) \
