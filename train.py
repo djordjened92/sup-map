@@ -7,7 +7,7 @@ import argparse
 import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
-from model import GCN, map_eq_loss
+from model import GCN, avg_internal_variance, randomwalk_nodes, filter_graph_by_rw, map_eq_loss
 from utils import *
 from dataset import load_feat, load_labels, FeatureDataset
 from metrics import pairwise, bcubed
@@ -15,7 +15,8 @@ from torch_scatter import scatter
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from pytorch_metric_learning import samplers
-from torch_geometric.loader import NeighborLoader
+from torch_geometric.loader import NeighborLoader, RandomNodeLoader
+import torch_geometric.transforms as T
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:100"
@@ -43,47 +44,80 @@ class InfiniteDataLoader:
             data = next(self.data_iter)
         return data
 
-def train(model, optimizer, training_loader, labels, iterations, config, device):
+def train(model, optimizer, training_loader, iterations, config, device):
+    TAU = config.get('tau', 0.2)
+    # Proportional negative sampling: we'll sample a multiple of the existing edges
+    # rather than a fixed 5000, to keep the "flow" balanced.
+    NEG_MULTIPLIER = config.get('neg_multiplier', 100.0) 
+    
     running_loss = 0.
 
     for i in tqdm(range(iterations), 'Train loader:'):
-        b_features, b_labels = next(training_loader)
-        b_features = b_features.to(device)
-        b_labels = b_labels.to(device)
+        data = next(training_loader)
+        data = data.to(device)
+
+        # In RandomNodeLoader, data.y and data.x already represent the full partition
+        b_labels = data.y
         
-        optimizer.zero_grad()  # Clear gradients.
-        K = config['K']
-        data, nbrs = gen_graph(b_features, config, K, device)
-        out = model(data.x, data.edge_index)  # Perform a single forward pass.
+        optimizer.zero_grad()
+        
+        # Forward pass on the full cluster subgraph
+        out = model(data.x, data.edge_index)
 
-        # init_codelength = map_eq_loss(data.x, nbrs, b_labels)
-        # codelength = map_eq_loss(out, nbrs, b_labels)
-        # curr_loss = torch.clamp(codelength - init_codelength, min=init_codelength)
-        curr_loss = map_eq_loss(out, nbrs, b_labels)
+        # -----------------------------------------------------------------
+        # 1. Use the Real Subgraph Edges
+        # -----------------------------------------------------------------
+        # Since we are using RandomNodeLoader, the edges in data.edge_index 
+        # are already a coherent "real" community structure.
+        base_edges = data.edge_index
 
-        curr_loss.backward()  # Derive gradients.
-        optimizer.step()  # Update parameters based on gradients.
+        # -----------------------------------------------------------------
+        # 2. Simplified & Scaled Negative Edge Augmentation
+        # -----------------------------------------------------------------
+        # We sample roughly the same number of negative edges as real edges
+        num_real_edges = base_edges.size(1)
+        num_to_sample = int(num_real_edges * NEG_MULTIPLIER)
+        
+        # Sample random pairs from all nodes in the partition
+        rand_indices = torch.randint(0, data.num_nodes, (2, num_to_sample), device=device)
+        
+        # Filter: keep only edges between different labels
+        is_negative = (b_labels[rand_indices[0]] != b_labels[rand_indices[1]])
+        if is_negative.sum() == 0:
+            # EMERGENCY: Batch is pure. The Map Equation has nothing to learn.
+            # We skip this batch or use a very small modularity-style penalty
+            print('Skip batch, no new negative samples...')
+            continue
+
+        neg_edge_index = rand_indices[:, is_negative]
+
+        # -----------------------------------------------------------------
+        # 3. Combine and Compute Map Equation Loss
+        # -----------------------------------------------------------------
+        filtered_edge_index = torch.cat([base_edges, neg_edge_index], dim=1)
+
+        # Calculate codelength
+        # The Map Equation will now try to:
+        # 1. Keep flow within same-label edges (base_edges)
+        # 2. Minimize flow across different-label edges (neg_edge_index)
+        curr_loss = map_eq_loss(out, filtered_edge_index, b_labels, tau=TAU)
+
+        curr_loss.backward()
+        optimizer.step()
+        
         running_loss += curr_loss.item()
-
-        # free up gpu memory
         torch.cuda.empty_cache()
 
     return running_loss / iterations
 
-def inference(in_graph, in_nbrs, in_ji, model, data_loader, config, device):
-    out = torch.zeros((in_graph.num_nodes, config['OUT_DIM']), device=device)
+def inference(in_graph, model, data_loader, config, device):
+    out_x = torch.zeros((in_graph.num_nodes, config['OUT_DIM']), device=device)
     for data in data_loader:
+        data = data.to(device)
         local_idx = (data.input_id[:, None]==data.n_id).nonzero()[:, 1]
-        out[data.input_id, :] = model(data.x, data.edge_index)[local_idx]
-    torch.cuda.empty_cache()
+        out_x[data.input_id, :] = model(data.x, data.edge_index)[local_idx]
 
-    # Calculate similarities for the same neighbours before GCN inference
-    # We calculate row-by-row similarities due to VRAM limitation
-    out_sims = torch.zeros_like(in_nbrs, dtype=torch.float32, device=device)
-    for i, out_feat in enumerate(out):
-        out_sims[i, :] = torch.clamp(out[in_nbrs[i]]@out_feat, 0.)
-
-    return out_sims
+    return out_x
 
 def main(config_path, device):
     # Load config
@@ -92,12 +126,6 @@ def main(config_path, device):
 
     # Load data
     feat_dim = config['FEATURE_DIM']
-
-    train_feat_path = config['TRAIN_FEATURES']
-    train_feat = load_feat(train_feat_path, feat_dim)
-    train_features = l2norm(train_feat)
-    print('Train:')
-    print('features shape:', train_features.shape)
 
     train_label_path = config['TRAIN_LABELS']
     train_labels = load_labels(train_label_path)
@@ -108,16 +136,7 @@ def main(config_path, device):
 
     if os.path.exists(graph_dir):
         test_in_graph = torch.load(f'{graph_dir}/test_graph.pt', weights_only=False)
-        test_nbrs_bounds = torch.load(f'{graph_dir}/test_nbrs_bounds.pt', weights_only=False)
-        test_in_graph['nbrs_bounds'] = test_nbrs_bounds
-        test_nbrs = torch.load(f'{graph_dir}/test_nbrs.pt', weights_only=False)
-        test_ji = torch.load(f'{graph_dir}/test_ji.pt', weights_only=False)
-
         train_in_graph = torch.load(f'{graph_dir}/train_graph.pt', weights_only=False)
-        train_nbrs_bounds = torch.load(f'{graph_dir}/train_nbrs_bounds.pt', weights_only=False)
-        train_in_graph['nbrs_bounds'] = train_nbrs_bounds
-        train_nbrs = torch.load(f'{graph_dir}/train_nbrs.pt', weights_only=False)
-        train_ji = torch.load(f'{graph_dir}/train_ji.pt', weights_only=False)
     else:
         os.makedirs(graph_dir)
 
@@ -127,19 +146,19 @@ def main(config_path, device):
         train_features = l2norm(train_feat)
         print('Train:')
         print('features shape:', train_features.shape)
-        train_in_graph, train_nbrs = gen_graph(torch.from_numpy(train_features).to(device),
+        train_in_graph, _ = gen_graph(torch.from_numpy(train_features).to(device),
                                                         config,
-                                                        80,
+                                                        60,
                                                         device,
-                                                        z_score=True)
-        train_ji = jaccard_index(train_nbrs,
-                                torch.zeros_like(train_nbrs, device=device).float(),
-                                1.,
-                                train_in_graph['nbrs_bounds'])
+                                                        z_score=False)
+        # train_in_graph = preprocess_graph_deterministic(train_in_graph,
+        #                                      batch_size=10,
+        #                                      device="cpu",
+        #                                      batching="range",
+        #                                      write_dir=None,
+        #                                      pe_type="spd",
+        #                                      pe_kwargs={"num_anchors": 3, "cutoff": 4})
         torch.save(train_in_graph, f'{graph_dir}/train_graph.pt')
-        torch.save(train_in_graph['nbrs_bounds'], f'{graph_dir}/train_nbrs_bounds.pt')
-        torch.save(train_nbrs, f'{graph_dir}/train_nbrs.pt')
-        torch.save(train_ji, f'{graph_dir}/train_ji.pt')
 
         # Generate test graph 
         val_feat_path = config['VAL_FEATURES']
@@ -147,39 +166,50 @@ def main(config_path, device):
         val_features = l2norm(val_feat)
         print('Test:')
         print('features shape:', val_features.shape)
-        test_in_graph, test_nbrs = gen_graph(torch.from_numpy(val_features).to(device),
+        test_in_graph, _ = gen_graph(torch.from_numpy(val_features).to(device),
                                                         config,
-                                                        80,
+                                                        60,
                                                         device,
-                                                        z_score=True)
-        test_ji = jaccard_index(test_nbrs,
-                                torch.zeros_like(test_nbrs, device=device).float(),
-                                1.,
-                                test_in_graph['nbrs_bounds'])
+                                                        z_score=False)
+        # test_in_graph = preprocess_graph_deterministic(test_in_graph,
+        #                                 batch_size=10,
+        #                                 device="cpu",
+        #                                 batching="range",
+        #                                 write_dir=None,
+        #                                 pe_type="spd",
+        #                                 pe_kwargs={"num_anchors": 3, "cutoff": 4})
         torch.save(test_in_graph, f'{graph_dir}/test_graph.pt')
-        torch.save(test_in_graph['nbrs_bounds'], f'{graph_dir}/test_nbrs_bounds.pt')
-        torch.save(test_nbrs, f'{graph_dir}/test_nbrs.pt')
-        torch.save(test_ji, f'{graph_dir}/test_ji.pt')
 
     print('\nTrain')
-    train_K_median = train_in_graph['nbrs_bounds'].median().int()
-    print(f"Median of neighbour bound: {train_K_median}")
-    print(f"Mean of neighbour bound: {train_in_graph['nbrs_bounds'].float().mean()}")
+    print(f"Mean of neighbour bound: {train_in_graph.edge_index.shape[1] // train_in_graph.x.shape[0]}")
     print('Test')
-    test_K_median = test_in_graph['nbrs_bounds'].median().int()
-    print(f"Median of neighbour bound: {test_K_median}")
-    print(f"Mean of neighbour bound: {test_in_graph['nbrs_bounds'].float().mean()}")
+    print(f"Mean of neighbour bound: {test_in_graph.edge_index.shape[1] // test_in_graph.x.shape[0]}")
 
-    batch_size = config['BATCH_SIZE']
+    # Create dataloaders
+    train_in_graph.y = torch.from_numpy(train_labels)
+    # batch_size = config['BATCH_SIZE']
     # train_loader = NeighborLoader(
     #     train_in_graph,
-    #     num_neighbors=[-1, -1],
+    #     num_neighbors=[40, 10],
     #     batch_size=batch_size,
     #     shuffle=True
     # )
+
+    train_in_graph = train_in_graph.to('cpu')
+    train_loader = RandomNodeLoader(train_in_graph, num_parts=1000, shuffle=True)
+
+    train_loader_iterator = InfiniteDataLoader(train_loader)
+    miniepoch_len = 200
+
     test_loader = NeighborLoader(
         test_in_graph,
-        num_neighbors=[-1, -1],
+        num_neighbors=[-1],
+        batch_size=512,
+        shuffle=False
+    )
+    train_eval_loader = NeighborLoader(
+        train_in_graph,
+        num_neighbors=[-1],
         batch_size=512,
         shuffle=False
     )
@@ -190,21 +220,9 @@ def main(config_path, device):
     print(f'num of labels: {val_labels.shape[0]}')
     print(f'#cls: {val_classes}')
 
-    # Create Dataset
-    train_dataset = FeatureDataset(train_features, train_labels)
-    sampler = samplers.MPerClassSampler(labels=train_labels,
-                                        m=config['SAMPLES_PER_CLASS'],
-                                        batch_size=batch_size,
-                                        length_before_new_iter=250000)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
-
     # Create model
     model = GCN(in_dim=feat_dim, hidden_dim=config['HIDDEN_DIM'], out_dim=config['OUT_DIM'], dropout=config['DROPOUT'])
     print(f'GCN model:\n {model}\n')
-
-    # ckpt_dir = '/home/djordje/Documents/Projects/face-mod/checkpoints/bs60_k60_lr1.1e-4_ep500_do0.15_012/model_best-232.pth'
-    # state_dict = torch.load(ckpt_dir)
-    # model.load_state_dict(state_dict)
 
     # Checkpoint dir
     model_dir = os.path.join(config['CHECKPOINT_DIR'], config['MODEL_NAME'])
@@ -226,28 +244,11 @@ def main(config_path, device):
     model = model.to(device)
     best_fp = -np.Inf
 
-    # for _ in range(232):
-    #     scheduler.step()
-    # Initial cluster metrics
-    # test_sims = torch.zeros_like(test_nbrs, dtype=torch.float32, device=device)
-    # for i, out_feat in enumerate(test_in_graph.x):
-    #     test_sims[i, :] = torch.clamp(test_in_graph.x[test_nbrs[i]]@out_feat, 0.)
-    # torch.cuda.empty_cache()
-    # pred_labels = face_cluster(test_nbrs.cpu().numpy(), test_sims.cpu().numpy())
-    # avg_pre_p, avg_rec_p, fscore_p = pairwise(val_labels, pred_labels)
-    # avg_pre_b, avg_rec_b, fscore_b = bcubed(val_labels, pred_labels)
-    # print('\nInitial metrics')
-    # print('#pairwise: avg_pre:{:.4f}, avg_rec:{:.4f}, fscore:{:.4f}'.format(avg_pre_p, avg_rec_p, fscore_p))
-    # print('#bicubic: avg_pre:{:.4f}, avg_rec:{:.4f}, fscore:{:.4f}\n'.format(avg_pre_b, avg_rec_b, fscore_b))
-
-    train_loader_iterator = InfiniteDataLoader(train_loader)
-    miniepoch_len = 200
     for epoch in range(1, epochs):
         model.train()
         epoch_loss = train(model,
                            optimizer,
                            train_loader_iterator,
-                           torch.from_numpy(train_labels),
                            miniepoch_len,
                            config,
                            device)
@@ -257,22 +258,19 @@ def main(config_path, device):
         tb_writer.add_scalar('Train/Loss', epoch_loss, epoch)
 
         # Evaluate
-        if epoch > 0 and epoch % 8 == 0:
+        if epoch > 0 and epoch % 2 == 0:
             print(f'Epoch: {epoch:05d}, Loss: {epoch_loss:.4f}')
 
             model.eval()
             with torch.no_grad():
                 # Evaluate model on the test graph, optimize tau
                 print('Evaluate test graph:')
-                test_sims = inference(test_in_graph,
-                                        test_nbrs,
-                                        test_ji,
-                                        model,
-                                        test_loader,
-                                        config,
-                                        device)
-                pred_labels = face_cluster(test_nbrs.cpu().numpy(),
-                                           test_sims.cpu().numpy(),
+                test_x = inference(test_in_graph,
+                                   model,
+                                   test_loader,
+                                   config,
+                                   device)
+                pred_labels = face_cluster(Data(test_x, test_in_graph.edge_index),
                                            no_self_links=True)
                 avg_pre_p, avg_rec_p, fscore_p = pairwise(val_labels, pred_labels)
                 avg_pre_b, avg_rec_b, fscore_b = bcubed(val_labels, pred_labels)
@@ -301,28 +299,27 @@ def main(config_path, device):
 
 
                 # Calculate train metrics
-                # print('Evaluate train graph:')
-                # train_sims = inference(train_in_graph,
-                #                         train_nbrs,
-                #                         train_ji,
-                #                         model,
-                #                         train_loader,
-                #                         config,
-                #                         device)
+                print('Evaluate train graph:')
+                train_x = inference(train_in_graph,
+                                        model,
+                                        train_eval_loader,
+                                        config,
+                                        device)
 
-                # pred_labels = face_cluster(train_nbrs.cpu().numpy(), train_sims.cpu().numpy())
-                # avg_pre_p, avg_rec_p, fscore_p = pairwise(train_labels, pred_labels)
-                # avg_pre_b, avg_rec_b, fscore_b = bcubed(train_labels, pred_labels)
+                pred_labels = face_cluster(Data(train_x, train_in_graph.edge_index),
+                                           no_self_links=True)
+                avg_pre_p, avg_rec_p, fscore_p = pairwise(train_labels, pred_labels)
+                avg_pre_b, avg_rec_b, fscore_b = bcubed(train_labels, pred_labels)
 
-                # print('#pairwise: avg_pre:{:.4f}, avg_rec:{:.4f}, fscore:{:.4f}'.format(avg_pre_p, avg_rec_p, fscore_p))
-                # tb_writer.add_scalar('Train_Metrics/precision_p', avg_pre_p, epoch)
-                # tb_writer.add_scalar('Train_Metrics/recall_p', avg_rec_p, epoch)
-                # tb_writer.add_scalar('Train_Metrics/Fp', fscore_p, epoch)
+                print('#pairwise: avg_pre:{:.4f}, avg_rec:{:.4f}, fscore:{:.4f}'.format(avg_pre_p, avg_rec_p, fscore_p))
+                tb_writer.add_scalar('Train_Metrics/precision_p', avg_pre_p, epoch)
+                tb_writer.add_scalar('Train_Metrics/recall_p', avg_rec_p, epoch)
+                tb_writer.add_scalar('Train_Metrics/Fp', fscore_p, epoch)
 
-                # print('#bicubic: avg_pre:{:.4f}, avg_rec:{:.4f}, fscore:{:.4f}'.format(avg_pre_b, avg_rec_b, fscore_b))
-                # tb_writer.add_scalar('Train_Metrics/precision_b', avg_pre_b, epoch)
-                # tb_writer.add_scalar('Train_Metrics/recall_b', avg_rec_b, epoch)
-                # tb_writer.add_scalar('Train_Metrics/Fb', fscore_b, epoch)
+                print('#bicubic: avg_pre:{:.4f}, avg_rec:{:.4f}, fscore:{:.4f}'.format(avg_pre_b, avg_rec_b, fscore_b))
+                tb_writer.add_scalar('Train_Metrics/precision_b', avg_pre_b, epoch)
+                tb_writer.add_scalar('Train_Metrics/recall_b', avg_rec_b, epoch)
+                tb_writer.add_scalar('Train_Metrics/Fb', fscore_b, epoch)
 
                 # free up gpu memory
                 torch.cuda.empty_cache()

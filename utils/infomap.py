@@ -1,73 +1,74 @@
-from time import time
+import torch
 import numpy as np
-from tqdm import tqdm
 import infomap
+from time import time
+from tqdm import tqdm
 
-def face_cluster(nbrs,
-                 sims,
+def face_cluster(data,
+                 batch_size=500_000, 
                  flow_model='undirected',
-                 regularized=False,
-                 regularization_strength=0.,
-                 no_self_links=False,
-                 silent=True):
-    sims = sims / np.sum(sims, axis=1, keepdims=True)
+                 no_self_links=True,
+                 silent=False):
     t = time()
-    single, links, weights = [], [], []
-    for i, nbrs_i in enumerate(nbrs):
-        count = 0
-        for idx, j in enumerate(nbrs_i):
-            if i == j:
-                pass
-            else:
-                count += 1
-                links.append((i, j))
-                weights.append(sims[i, idx])
-        if count == 0:
-            single.append(i)
+    
+    device = data.x.device
+    num_nodes = data.x.size(0)
+    edge_index = data.edge_index
+    num_edges = edge_index.size(1)
+    
+    # Pre-normalize features to speed up cosine similarity
+    x_norm = torch.nn.functional.normalize(data.x, p=2, dim=1)
 
-    info = infomap.Infomap("--two-level",
-                           flow_model=flow_model,
-                           regularized=regularized,
-                           regularization_strength=regularization_strength,
-                           no_self_links=no_self_links,
-                           silent=silent)
-    for (i, j), sim in tqdm(zip(links, weights)):
-        _ = info.addLink(i, j, sim)
-    del links
-    del weights
+    # Initialize Infomap
+    # Note: ensure your infomap version supports these arguments
+    info = infomap.Infomap(
+        "--two-level --seed 100",
+        flow_model=flow_model,
+        no_self_links=no_self_links,
+        silent=silent
+    )
 
-    info.run(seed=100)
+    # Batched Similarity Calculation
+    for i in tqdm(range(0, num_edges, batch_size), desc="Adding links", disable=silent):
+        end = min(i + batch_size, num_edges)
+        batch_edges = edge_index[:, i:end]
+        
+        src, dst = batch_edges[0], batch_edges[1]
+        
+        # Calculate cosine similarity on GPU
+        sim_batch = (x_norm[src] * x_norm[dst]).sum(dim=-1)
+        
+        # Move to CPU for Infomap ingestion
+        src_cpu = src.cpu().numpy()
+        dst_cpu = dst.cpu().numpy()
+        sim_cpu = sim_batch.cpu().numpy()
 
-    lb2idx = {}
-    idx2lb = {}
+        for idx in range(len(src_cpu)):
+            u, v, w = int(src_cpu[idx]), int(dst_cpu[idx]), float(sim_cpu[idx])
+            # Infomap requires weights > 0
+            if w > 0:
+                info.add_link(u, v, round(w, 8))
+
+    print("Running Infomap solver (this may take a while)...")
+    info.run()
+
+    # Create label array
+    pred_labels = np.zeros(num_nodes, dtype=int) - 1
+    
+    # Iterate through the tree and extract leaf nodes
     for node in info.iterTree():
-        if node.moduleIndex() not in lb2idx:
-            lb2idx[node.moduleIndex()] = []
-        lb2idx[node.moduleIndex()].append(node.physicalId)
+        if node.is_leaf:
+            # node.physical_id is the original index provided in add_link
+            # node.module_id is the cluster assignment
+            pred_labels[node.physicalId] = node.moduleIndex()
 
-    for k, v in lb2idx.items():
-        if k == 0:
-            lb2idx[k] = v[2:]
-            for u in v[2:]:
-                idx2lb[u] = k
-        else:
-            lb2idx[k] = v[1:]
-            for u in v[1:]:
-                idx2lb[u] = k
+    # Handle nodes that were not part of any edges (isolated nodes)
+    unassigned = np.where(pred_labels == -1)[0]
+    if len(unassigned) > 0:
+        # Start new IDs from the highest existing cluster ID + 1
+        current_max = pred_labels.max() if pred_labels.max() >= 0 else 0
+        for i, node_idx in enumerate(unassigned):
+            pred_labels[node_idx] = current_max + 1 + i
 
-    lb_len = len(lb2idx)
-    if len(single) > 0:
-        for k in single:
-            if k in idx2lb:
-                continue
-            idx2lb[k] = lb_len
-            lb2idx[lb_len] = [k]
-            lb_len += 1
-    print('time cost of FaceMap: {:.2f}s'.format(time() - t))
-
-    idx_len = max(list(idx2lb.keys()))
-    pred_labels = np.zeros(idx_len + 1) - 1
-    for k, v in idx2lb.items():
-        pred_labels[k] = v
-
+    print(f'Done. Total time: {time() - t:.2f}s')
     return pred_labels

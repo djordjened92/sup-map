@@ -1,5 +1,5 @@
 # Model dir
-MODEL_NAME: bs40000_k60_lr5e-5_ep500_do0.2_030
+MODEL_NAME: test1
 CHECKPOINT_DIR: './checkpoints'
 
 # Data
@@ -8,19 +8,20 @@ TRAIN_LABELS: '/home/djordje/Documents/Projects/pyg/learn-to-cluster/data/labels
 VAL_FEATURES: '/home/djordje/Documents/Projects/pyg/learn-to-cluster/data/features/part1_test.bin'
 VAL_LABELS: '/home/djordje/Documents/Projects/pyg/learn-to-cluster/data/labels/part1_test.meta'
 FEATURE_DIM: 256
-BATCH_SIZE: 40000
+BATCH_SIZE: 40
 SAMPLES_PER_CLASS: 40
+MIN_EDGES_PER_CLASS: 0
 
 # Graph
-K: 60
+K: 50
 
 # TAU: 0.3
-HIDDEN_DIM: 512
+HIDDEN_DIM: 256
 OUT_DIM: 256
-WINDOW_SIZE: 20
+WINDOW_SIZE: 0
 
 # Training
-LR: 0.00005
-EPOCHS: 500
-WEIGHT_DECAY: 0.
-DROPOUT: 0.2
+LR: 0.00015
+EPOCHS: 200
+WEIGHT_DECAY: 0.00003
+DROPOUT: 0.15
