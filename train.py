@@ -45,62 +45,64 @@ class InfiniteDataLoader:
         return data
 
 def train(model, optimizer, training_loader, iterations, config, device):
-    TAU = config.get('tau', 0.2)
-    # Proportional negative sampling: we'll sample a multiple of the existing edges
-    # rather than a fixed 5000, to keep the "flow" balanced.
-    NEG_MULTIPLIER = config.get('neg_multiplier', 100.0) 
+    TAU = config.get('tau', 0.5)
+    # We reduce the final multiplier because these edges are "high quality"
+    # But we sample a larger pool initially to find them.
+    NEG_MULTIPLIER = config.get('neg_multiplier', 5.0) 
+    POOL_FACTOR = 50.0 # How many random pairs to check before picking the hardest
     
+    two_hop_transform = T.TwoHop()
     running_loss = 0.
 
     for i in tqdm(range(iterations), 'Train loader:'):
         data = next(training_loader)
         data = data.to(device)
-
-        # In RandomNodeLoader, data.y and data.x already represent the full partition
+        data = two_hop_transform(data)
         b_labels = data.y
         
         optimizer.zero_grad()
-        
-        # Forward pass on the full cluster subgraph
         out = model(data.x, data.edge_index)
 
-        # -----------------------------------------------------------------
-        # 1. Use the Real Subgraph Edges
-        # -----------------------------------------------------------------
-        # Since we are using RandomNodeLoader, the edges in data.edge_index 
-        # are already a coherent "real" community structure.
+        # 1. Base edges (Positive structure)
         base_edges = data.edge_index
+        num_real_edges = base_edges.size(1)
 
         # -----------------------------------------------------------------
-        # 2. Simplified & Scaled Negative Edge Augmentation
+        # 2. Hard Negative Mining Stage
         # -----------------------------------------------------------------
-        # We sample roughly the same number of negative edges as real edges
-        num_real_edges = base_edges.size(1)
-        num_to_sample = int(num_real_edges * NEG_MULTIPLIER)
+        # A. Sample a large pool of random pairs
+        num_pool = int(num_real_edges * POOL_FACTOR)
+        pool_indices = torch.randint(0, data.num_nodes, (2, num_pool), device=device)
         
-        # Sample random pairs from all nodes in the partition
-        rand_indices = torch.randint(0, data.num_nodes, (2, num_to_sample), device=device)
+        # B. Filter for actual negatives (different labels)
+        is_neg_label = (b_labels[pool_indices[0]] != b_labels[pool_indices[1]])
+        pool_neg_indices = pool_indices[:, is_neg_label]
         
-        # Filter: keep only edges between different labels
-        is_negative = (b_labels[rand_indices[0]] != b_labels[rand_indices[1]])
-        if is_negative.sum() == 0:
-            # EMERGENCY: Batch is pure. The Map Equation has nothing to learn.
-            # We skip this batch or use a very small modularity-style penalty
-            print('Skip batch, no new negative samples...')
+        if pool_neg_indices.size(1) == 0:
             continue
 
-        neg_edge_index = rand_indices[:, is_negative]
+        # C. Find "Hard" Negatives: Calculate similarity for the pool
+        # We use .detach() if we only want to use them as indices, 
+        # but keeping them attached is fine for map_eq_loss.
+        row_p, col_p = pool_neg_indices
+        pool_sims = (out[row_p] * out[col_p]).sum(dim=-1)
+        
+        # D. Select Top-K hardest (highest similarity)
+        num_hard = int(num_real_edges * NEG_MULTIPLIER)
+        num_hard = min(num_hard, pool_neg_indices.size(1)) # Safety check
+        
+        _, topk_idx = torch.topk(pool_sims, k=num_hard)
+        neg_edge_index = pool_neg_indices[:, topk_idx]
 
         # -----------------------------------------------------------------
-        # 3. Combine and Compute Map Equation Loss
+        # 3. Combine and Loss
         # -----------------------------------------------------------------
         filtered_edge_index = torch.cat([base_edges, neg_edge_index], dim=1)
 
-        # Calculate codelength
-        # The Map Equation will now try to:
-        # 1. Keep flow within same-label edges (base_edges)
-        # 2. Minimize flow across different-label edges (neg_edge_index)
-        curr_loss = map_eq_loss(out, filtered_edge_index, b_labels, tau=TAU)
+        avg_var, var_means = avg_internal_variance(filtered_edge_index, out, b_labels)
+        
+        # Map Equation Loss + Geometric Regularization
+        curr_loss = map_eq_loss(out, filtered_edge_index, b_labels, tau=TAU) + 0.2 * avg_var + var_means
 
         curr_loss.backward()
         optimizer.step()
@@ -196,20 +198,20 @@ def main(config_path, device):
     # )
 
     train_in_graph = train_in_graph.to('cpu')
-    train_loader = RandomNodeLoader(train_in_graph, num_parts=1000, shuffle=True)
+    train_loader = RandomNodeLoader(train_in_graph, num_parts=50, shuffle=True)
 
     train_loader_iterator = InfiniteDataLoader(train_loader)
-    miniepoch_len = 200
+    miniepoch_len = 100
 
     test_loader = NeighborLoader(
         test_in_graph,
-        num_neighbors=[-1],
+        num_neighbors=[-1, -1],
         batch_size=512,
         shuffle=False
     )
     train_eval_loader = NeighborLoader(
         train_in_graph,
-        num_neighbors=[-1],
+        num_neighbors=[-1, -1],
         batch_size=512,
         shuffle=False
     )
@@ -244,23 +246,25 @@ def main(config_path, device):
     model = model.to(device)
     best_fp = -np.Inf
 
-    for epoch in range(1, epochs):
+    for epoch in range(epochs):
         model.train()
-        epoch_loss = train(model,
-                           optimizer,
-                           train_loader_iterator,
-                           miniepoch_len,
-                           config,
-                           device)
-        scheduler.step()
 
-        # Add to tensorboard
-        tb_writer.add_scalar('Train/Loss', epoch_loss, epoch)
+        # Evaluation in step 0 is for pre-training metrics
+        if epoch > -1:
+            epoch_loss = train(model,
+                            optimizer,
+                            train_loader_iterator,
+                            miniepoch_len,
+                            config,
+                            device)
+            scheduler.step()
 
-        # Evaluate
-        if epoch > 0 and epoch % 2 == 0:
+            # Add to tensorboard
+            tb_writer.add_scalar('Train/Loss', epoch_loss, epoch)
             print(f'Epoch: {epoch:05d}, Loss: {epoch_loss:.4f}')
 
+        # Evaluate
+        if epoch > 50 and epoch % 4 == 0:
             model.eval()
             with torch.no_grad():
                 # Evaluate model on the test graph, optimize tau
