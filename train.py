@@ -120,7 +120,7 @@ def train(model,
         # -----------------------------------------------------------------
         # 3. Loss
         # -----------------------------------------------------------------
-        avg_var, var_means = avg_internal_variance(filtered_edge_index, out, b_labels)
+        avg_var, var_means = avg_internal_variance(base_edges, out, b_labels)
         
         # Map Equation Loss + Geometric Regularization
         curr_loss = map_eq_loss(out, filtered_edge_index, b_labels, tau=TAU) + 0.2 * avg_var + var_means
@@ -295,7 +295,7 @@ def main(config_path, device):
             print(f'Epoch: {epoch:05d}, Loss: {epoch_loss:.4f}')
 
         # Evaluate
-        if epoch > 1 and epoch % 4 == 0:
+        if epoch > 40 and epoch % 4 == 0:
             model.eval()
             with torch.no_grad():
                 # Evaluate model on the test graph, optimize tau
