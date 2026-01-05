@@ -11,6 +11,7 @@ from model import GCN, avg_internal_variance, randomwalk_nodes, filter_graph_by_
 from utils import *
 from dataset import load_feat, load_labels, FeatureDataset
 from metrics import pairwise, bcubed
+from negatives_sampler import EntropyNegativeSampler
 from torch_scatter import scatter
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
@@ -44,7 +45,15 @@ class InfiniteDataLoader:
             data = next(self.data_iter)
         return data
 
-def train(model, optimizer, training_loader, iterations, config, device):
+def train(model,
+          optimizer,
+          epoch,
+          num_epochs,
+          neg_sampler,
+          training_loader,
+          iterations,
+          config,
+          device):
     TAU = config.get('tau', 0.5)
     # We reduce the final multiplier because these edges are "high quality"
     # But we sample a larger pool initially to find them.
@@ -67,43 +76,54 @@ def train(model, optimizer, training_loader, iterations, config, device):
         base_edges = data.edge_index
         num_real_edges = base_edges.size(1)
 
-        # -----------------------------------------------------------------
-        # 2. Hard Negative Mining Stage
-        # -----------------------------------------------------------------
-        # A. Sample a large pool of random pairs
-        num_pool = int(num_real_edges * POOL_FACTOR)
-        pool_indices = torch.randint(0, data.num_nodes, (2, num_pool), device=device)
+        # # -----------------------------------------------------------------
+        # # 2. Hard Negative Mining Stage - simple topk sampler
+        # # -----------------------------------------------------------------
+        # # A. Sample a large pool of random pairs
+        # num_pool = int(num_real_edges * POOL_FACTOR)
+        # pool_indices = torch.randint(0, data.num_nodes, (2, num_pool), device=device)
         
-        # B. Filter for actual negatives (different labels)
-        is_neg_label = (b_labels[pool_indices[0]] != b_labels[pool_indices[1]])
-        pool_neg_indices = pool_indices[:, is_neg_label]
+        # # B. Filter for actual negatives (different labels)
+        # is_neg_label = (b_labels[pool_indices[0]] != b_labels[pool_indices[1]])
+        # pool_neg_indices = pool_indices[:, is_neg_label]
         
-        if pool_neg_indices.size(1) == 0:
-            continue
+        # if pool_neg_indices.size(1) == 0:
+        #     continue
 
-        # C. Find "Hard" Negatives: Calculate similarity for the pool
-        # We use .detach() if we only want to use them as indices, 
-        # but keeping them attached is fine for map_eq_loss.
-        row_p, col_p = pool_neg_indices
-        pool_sims = (out[row_p] * out[col_p]).sum(dim=-1)
+        # # C. Find "Hard" Negatives: Calculate similarity for the pool
+        # # We use .detach() if we only want to use them as indices, 
+        # # but keeping them attached is fine for map_eq_loss.
+        # row_p, col_p = pool_neg_indices
+        # pool_sims = (out[row_p] * out[col_p]).sum(dim=-1)
         
-        # D. Select Top-K hardest (highest similarity)
-        num_hard = int(num_real_edges * NEG_MULTIPLIER)
-        num_hard = min(num_hard, pool_neg_indices.size(1)) # Safety check
+        # # D. Select Top-K hardest (highest similarity)
+        # num_hard = int(num_real_edges * NEG_MULTIPLIER)
+        # num_hard = min(num_hard, pool_neg_indices.size(1)) # Safety check
         
-        _, topk_idx = torch.topk(pool_sims, k=num_hard)
-        neg_edge_index = pool_neg_indices[:, topk_idx]
+        # _, topk_idx = torch.topk(pool_sims, k=num_hard)
+        # neg_edge_index = pool_neg_indices[:, topk_idx]
 
         # -----------------------------------------------------------------
-        # 3. Combine and Loss
+        # 2. Negative Mining Stage - Entropy-based
         # -----------------------------------------------------------------
-        filtered_edge_index = torch.cat([base_edges, neg_edge_index], dim=1)
+        neg_edge_index = neg_sampler.sample(out=out,
+                                            edge_index=base_edges,
+                                            labels=b_labels,
+                                            epoch=epoch,
+                                            num_epochs=num_epochs)
 
+        if neg_edge_index is not None:
+            filtered_edge_index = torch.cat([base_edges, neg_edge_index], dim=1)
+        else:
+            filtered_edge_index = base_edges
+
+        # -----------------------------------------------------------------
+        # 3. Loss
+        # -----------------------------------------------------------------
         avg_var, var_means = avg_internal_variance(filtered_edge_index, out, b_labels)
         
         # Map Equation Loss + Geometric Regularization
         curr_loss = map_eq_loss(out, filtered_edge_index, b_labels, tau=TAU) + 0.2 * avg_var + var_means
-
         curr_loss.backward()
         optimizer.step()
         
@@ -134,7 +154,7 @@ def main(config_path, device):
     print(f'num of labels: {train_labels.shape[0]}')
     print(f'#cls: {len(np.unique(train_labels))}\n')
 
-    graph_dir = f'ws{config["WINDOW_SIZE"]}'
+    graph_dir = f'ws{config["WINDOW_SIZE"]}_k45'
 
     if os.path.exists(graph_dir):
         test_in_graph = torch.load(f'{graph_dir}/test_graph.pt', weights_only=False)
@@ -150,7 +170,7 @@ def main(config_path, device):
         print('features shape:', train_features.shape)
         train_in_graph, _ = gen_graph(torch.from_numpy(train_features).to(device),
                                                         config,
-                                                        60,
+                                                        45,
                                                         device,
                                                         z_score=False)
         # train_in_graph = preprocess_graph_deterministic(train_in_graph,
@@ -170,7 +190,7 @@ def main(config_path, device):
         print('features shape:', val_features.shape)
         test_in_graph, _ = gen_graph(torch.from_numpy(val_features).to(device),
                                                         config,
-                                                        60,
+                                                        45,
                                                         device,
                                                         z_score=False)
         # test_in_graph = preprocess_graph_deterministic(test_in_graph,
@@ -246,17 +266,28 @@ def main(config_path, device):
     model = model.to(device)
     best_fp = -np.Inf
 
+    # Negatives sampler
+    neg_sampler = EntropyNegativeSampler(tb_writer,
+                                         neg_multiplier=config.get("neg_multiplier", 5.0),
+                                         pool_factor=50,
+                                         alpha=1.0,
+                                         delta_start=5.0,
+                                         delta_end=0.0)
+
     for epoch in range(epochs):
         model.train()
 
         # Evaluation in step 0 is for pre-training metrics
         if epoch > -1:
             epoch_loss = train(model,
-                            optimizer,
-                            train_loader_iterator,
-                            miniepoch_len,
-                            config,
-                            device)
+                               optimizer,
+                               epoch,
+                               epochs,
+                               neg_sampler,
+                               train_loader_iterator,
+                               miniepoch_len,
+                               config,
+                               device)
             scheduler.step()
 
             # Add to tensorboard
@@ -264,7 +295,7 @@ def main(config_path, device):
             print(f'Epoch: {epoch:05d}, Loss: {epoch_loss:.4f}')
 
         # Evaluate
-        if epoch > 50 and epoch % 4 == 0:
+        if epoch > 1 and epoch % 4 == 0:
             model.eval()
             with torch.no_grad():
                 # Evaluate model on the test graph, optimize tau

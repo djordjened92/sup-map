@@ -1,5 +1,5 @@
 # Model dir
-MODEL_NAME: test11
+MODEL_NAME: test13
 CHECKPOINT_DIR: './checkpoints'
 
 # Data
