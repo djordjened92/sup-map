@@ -1,8 +1,8 @@
-This README provides a technical overview of your GNN-based clustering solution. It is designed to optimize node embeddings for community detection by minimizing the description length of information flow within a k-Nearest Neighbor (k-NN) graph.
+This project is GNN-based clustering solution, designed to optimize node embeddings for community detection by minimizing the description length of information flow within a k-Nearest Neighbor (k-NN) graph.
 
 ---
 
-## Methodology: Plain Text Formulas
+## Methodology
 
 The following formulas are used within the implementation for loss calculation and sampling. You can copy-paste these directly into documentation or code comments.
 
@@ -97,5 +97,3 @@ The GNN architecture uses a residual pattern to preserve features across layers 
 * **Negative Sampling:** The `EntropyNegativeSampler` filters for pairs where `labels[i] != labels[j]` and selects pairs with the highest cosine similarity (hardest to distinguish) that still satisfy the entropy constraint.
 * **Sparse Flow:** `smart_teleportation_sparse` computes the steady-state distribution using power iteration on the sparse edge index to handle large graphs without  density.
 * **Evaluation:** Performance is tracked via **Pairwise F-score** (measuring if pairs are correctly grouped) and **B-Cubed** metrics (measuring precision/recall per node).
-
-Would you like me to generate the `metrics.py` script to calculate the Pairwise and B-Cubed scores used in this README?
