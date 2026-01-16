@@ -271,8 +271,9 @@ def main(config_path, device):
                                          neg_multiplier=config.get("neg_multiplier", 5.0),
                                          pool_factor=50,
                                          alpha=1.0,
-                                         delta_start=5.0,
-                                         delta_end=0.0)
+                                         delta_start=10.0,
+                                         delta_end=3.0,
+                                         anneal_frac=0.8)
 
     for epoch in range(epochs):
         model.train()
